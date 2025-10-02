@@ -1,0 +1,66 @@
+name: List Available Versions
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 0 * * *'
+
+jobs:
+  fetch-versions:
+    runs-on: ubuntu-latest
+    outputs:
+      versions: ${{ steps.get_versions.outputs.versions }}
+      latest_version: ${{ steps.get_versions.outputs.latest_version }}
+    
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+    
+    - name: Get available versions
+      id: get_versions
+      run: |
+        RELEASES=$(curl -s \
+          -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+          -H "Accept: application/vnd.github.v3+json" \
+          "https://api.github.com/repos/github-aws-runners/terraform-aws-github-runner/releases?per_page=10")
+        
+        VERSIONS=$(echo "$RELEASES" | jq -r '.[].tag_name | select(. != null) | ltrimstr("v")')
+        LATEST=$(echo "$VERSIONS" | head -n1)
+        
+        VERSIONS_ARRAY=$(echo "$VERSIONS" | jq -R . | jq -s .)
+        
+        echo "versions=$VERSIONS_ARRAY" >> $GITHUB_OUTPUT
+        echo "latest_version=$LATEST" >> $GITHUB_OUTPUT
+        
+        echo "Available versions:"
+        echo "$VERSIONS"
+        echo "Latest version: $LATEST"
+    
+    - name: Update version info file
+      run: |
+        mkdir -p .github/data
+        cat > .github/data/available-versions.json <<EOF
+        {
+          "updated_at": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+          "latest_version": "${{ steps.get_versions.outputs.latest_version }}",
+          "available_versions": ${{ steps.get_versions.outputs.versions }}
+        }
+        EOF
+    
+    - name: Commit version info
+      run: |
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+        
+        if [[ -n $(git status --porcelain) ]]; then
+          git add .github/data/available-versions.json
+          git commit -m "Update available versions
+
+          Latest: ${{ steps.get_versions.outputs.latest_version }}
+          Updated: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+          
+          Automated version update"
+          git push
+        else
+          echo "No changes to commit"
+        fi

@@ -1,0 +1,299 @@
+name: Update GitHub Runner Module
+
+on:
+  workflow_dispatch:
+    inputs:
+      update_mode:
+        description: 'Update mode'
+        required: true
+        type: choice
+        options:
+          - 'select_version'
+          - 'latest_stable'
+          - 'custom_version'
+        default: 'select_version'
+      
+      target_version:
+        description: 'Target version (for custom_version mode)'
+        required: false
+        type: string
+      
+      auto_approve:
+        description: 'Auto approve Terraform Cloud run'
+        required: false
+        type: boolean
+        default: false
+
+env:
+  TF_CLOUD_ORGANIZATION: "your-company-runners"
+  TF_CLOUD_WORKSPACE: "github-actions-runners"
+
+jobs:
+  prepare-version-info:
+    runs-on: ubuntu-latest
+    outputs:
+      selected_version: ${{ steps.version_selection.outputs.selected_version }}
+      current_version: ${{ steps.current_version.outputs.version }}
+      available_versions: ${{ steps.get_versions.outputs.versions }}
+      release_notes_url: ${{ steps.version_selection.outputs.release_notes_url }}
+    
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+    
+    - name: Get current version
+      id: current_version
+      run: |
+        if [ -f .github/data/available-versions.json ]; then
+          CURRENT=$(jq -r '.latest_version' .github/data/available-versions.json 2>/dev/null || echo "unknown")
+        else
+          CURRENT="unknown"
+        fi
+        echo "version=$CURRENT" >> $GITHUB_OUTPUT
+        echo "Current version: $CURRENT"
+    
+    - name: Fetch available versions
+      id: get_versions
+      run: |
+        echo "Fetching available versions..."
+        
+        RELEASES=$(curl -s \
+          -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+          -H "Accept: application/vnd.github.v3+json" \
+          "https://api.github.com/repos/github-aws-runners/terraform-aws-github-runner/releases?per_page=15")
+        
+        VERSIONS=$(echo "$RELEASES" | jq -r '.[].tag_name | select(. != null) | ltrimstr("v")' | head -10)
+        LATEST=$(echo "$VERSIONS" | head -n1)
+        
+        echo "versions<<EOF" >> $GITHUB_OUTPUT
+        echo "$VERSIONS" >> $GITHUB_OUTPUT
+        echo "EOF" >> $GITHUB_OUTPUT
+        
+        echo "Available versions (latest 10):"
+        echo "$VERSIONS" | sed 's/^/  - /'
+    
+    - name: Version selection logic
+      id: version_selection
+      run: |
+        case "${{ github.event.inputs.update_mode }}" in
+          "latest_stable")
+            SELECTED=$(echo "${{ steps.get_versions.outputs.versions }}" | head -n1)
+            echo "Selected latest stable: $SELECTED"
+            ;;
+          "custom_version")
+            SELECTED="${{ github.event.inputs.target_version }}"
+            if [ -z "$SELECTED" ]; then
+              echo "Error: target_version is required for custom_version mode"
+              exit 1
+            fi
+            echo "Selected custom version: $SELECTED"
+            ;;
+          "select_version")
+            SELECTED=$(echo "${{ steps.get_versions.outputs.versions }}" | head -n1)
+            echo "Auto-selected latest for automation: $SELECTED"
+            echo "Available versions for manual selection:"
+            echo "${{ steps.get_versions.outputs.versions }}" | sed 's/^/  Version: /'
+            ;;
+          *)
+            echo "Error: Invalid update_mode"
+            exit 1
+            ;;
+        esac
+        
+        echo "selected_version=$SELECTED" >> $GITHUB_OUTPUT
+        echo "release_notes_url=https://github.com/github-aws-runners/terraform-aws-github-runner/releases/tag/v$SELECTED" >> $GITHUB_OUTPUT
+
+  execute-update:
+    needs: prepare-version-info
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
+    
+    - name: Version update summary
+      run: |
+        echo "====================================="
+        echo "    GitHub Runner Module Update"
+        echo "====================================="
+        echo ""
+        echo "Current Version: ${{ needs.prepare-version-info.outputs.current_version }}"
+        echo "Target Version:  ${{ needs.prepare-version-info.outputs.selected_version }}"
+        echo "Update Mode:     ${{ github.event.inputs.update_mode }}"
+        echo "Release Notes:   ${{ needs.prepare-version-info.outputs.release_notes_url }}"
+        echo ""
+    
+    - name: Configure Git
+      run: |
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+    
+    - name: Create update branch
+      run: |
+        TARGET_VERSION="${{ needs.prepare-version-info.outputs.selected_version }}"
+        BRANCH_NAME="update-runner-module-${TARGET_VERSION}-$(date +%Y%m%d-%H%M%S)"
+        
+        git checkout -b $BRANCH_NAME
+        echo "BRANCH_NAME=$BRANCH_NAME" >> $GITHUB_ENV
+    
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ap-northeast-1
+    
+    - name: Download Lambda artifacts
+      run: |
+        TARGET_VERSION="${{ needs.prepare-version-info.outputs.selected_version }}"
+        echo "Downloading Lambda artifacts for version $TARGET_VERSION..."
+        
+        chmod +x scripts/download_artifacts.sh
+        ./scripts/download_artifacts.sh $TARGET_VERSION
+    
+    - name: Update Terraform Cloud variable
+      run: |
+        TARGET_VERSION="${{ needs.prepare-version-info.outputs.selected_version }}"
+        
+        curl \
+          --header "Authorization: Bearer ${{ secrets.TF_CLOUD_TOKEN }}" \
+          --header "Content-Type: application/vnd.api+json" \
+          --request PATCH \
+          --data @- \
+          "https://app.terraform.io/api/v2/workspaces/$TF_CLOUD_WORKSPACE/vars/${{ secrets.TF_VAR_RUNNER_VERSION_ID }}" <<EOF
+        {
+          "data": {
+            "type": "vars",
+            "attributes": {
+              "key": "runner_module_version",
+              "value": "$TARGET_VERSION",
+              "category": "terraform"
+            }
+          }
+        }
+        EOF
+        
+        echo "Updated Terraform Cloud variable: runner_module_version = $TARGET_VERSION"
+    
+    - name: Commit changes
+      run: |
+        TARGET_VERSION="${{ needs.prepare-version-info.outputs.selected_version }}"
+        
+        git add .
+        git commit -m "Update terraform-aws-github-runner to $TARGET_VERSION
+
+        Update Details:
+        - Version: ${{ needs.prepare-version-info.outputs.current_version }} → $TARGET_VERSION
+        - Mode: ${{ github.event.inputs.update_mode }}
+        - Updated by: ${{ github.actor }}
+        - Lambda artifacts updated
+        - Terraform Cloud variables updated
+        
+        Release Notes: ${{ needs.prepare-version-info.outputs.release_notes_url }}
+        
+        Automated update via GitHub Actions"
+    
+    - name: Push branch
+      run: |
+        git push origin $BRANCH_NAME
+    
+    - name: Create Pull Request
+      id: create_pr
+      uses: peter-evans/create-pull-request@v5
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
+        title: "Update terraform-aws-github-runner to ${{ needs.prepare-version-info.outputs.selected_version }}"
+        body: |
+          ## Version Update Summary
+          
+          | Item | Value |
+          |------|-------|
+          | **Previous Version** | `${{ needs.prepare-version-info.outputs.current_version }}` |
+          | **Target Version** | `${{ needs.prepare-version-info.outputs.selected_version }}` |
+          | **Update Mode** | `${{ github.event.inputs.update_mode }}` |
+          | **Updated by** | @${{ github.actor }} |
+          
+          ## Changes Made
+          - Updated module version to `${{ needs.prepare-version-info.outputs.selected_version }}`
+          - Downloaded and prepared Lambda artifacts
+          - Updated Terraform Cloud workspace variables
+          
+          ## Next Steps
+          
+          ### 1. Plan Review
+          - [ ] Review [Terraform Cloud Plan](https://app.terraform.io/app/${{ env.TF_CLOUD_ORGANIZATION }}/workspaces/${{ env.TF_CLOUD_WORKSPACE }})
+          - [ ] Verify changes are as expected
+          
+          ### 2. Deployment
+          - [ ] Approve and merge this PR
+          - [ ] Execute Apply in Terraform Cloud
+          
+          ## References
+          - [Release Notes](${{ needs.prepare-version-info.outputs.release_notes_url }})
+          - [Module Documentation](https://github.com/github-aws-runners/terraform-aws-github-runner)
+        branch: ${{ env.BRANCH_NAME }}
+        delete-branch: true
+    
+    outputs:
+      pr_number: ${{ steps.create_pr.outputs.pull-request-number }}
+
+  trigger-terraform-plan:
+    needs: [prepare-version-info, execute-update]
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Trigger Terraform Cloud Plan
+      id: trigger_plan
+      run: |
+        TARGET_VERSION="${{ needs.prepare-version-info.outputs.selected_version }}"
+        
+        RESPONSE=$(curl -s \
+          --header "Authorization: Bearer ${{ secrets.TF_CLOUD_TOKEN }}" \
+          --header "Content-Type: application/vnd.api+json" \
+          --request POST \
+          --data @- \
+          "https://app.terraform.io/api/v2/workspaces/${{ env.TF_CLOUD_WORKSPACE }}/runs" <<EOF
+        {
+          "data": {
+            "type": "runs",
+            "attributes": {
+              "message": "Plan for terraform-aws-github-runner update to $TARGET_VERSION"
+            }
+          }
+        }
+        EOF
+        )
+        
+        RUN_ID=$(echo "$RESPONSE" | jq -r '.data.id')
+        RUN_URL="https://app.terraform.io/app/${{ env.TF_CLOUD_ORGANIZATION }}/workspaces/${{ env.TF_CLOUD_WORKSPACE }}/runs/$RUN_ID"
+        
+        echo "run_id=$RUN_ID" >> $GITHUB_OUTPUT
+        echo "run_url=$RUN_URL" >> $GITHUB_OUTPUT
+        
+        echo "Terraform Cloud Plan triggered"
+        echo "Run ID: $RUN_ID"
+    
+    - name: Comment on PR with Plan info
+      uses: peter-evans/create-or-update-comment@v3
+      with:
+        issue-number: ${{ needs.execute-update.outputs.pr_number }}
+        body: |
+          ## Terraform Cloud Plan Started
+          
+          **Target Version**: `${{ needs.prepare-version-info.outputs.selected_version }}`  
+          **Plan Status**: In Progress
+          
+          ### Plan Details
+          - **Run ID**: `${{ steps.trigger_plan.outputs.run_id }}`
+          - **Workspace**: `${{ env.TF_CLOUD_WORKSPACE }}`
+          
+          ### Links
+          - [View Plan Results](${{ steps.trigger_plan.outputs.run_url }})
+          
+          ### Next Steps
+          1. Wait for Plan to complete
+          2. Review Plan results in Terraform Cloud
+          3. If Plan looks good, merge this PR
+          4. Execute Apply in Terraform Cloud
