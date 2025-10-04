@@ -1,0 +1,32 @@
+  name: Test Self-hosted Runner
+
+  on:
+    workflow_dispatch:
+
+  jobs:
+    test:
+      runs-on: self-hosted
+      timeout-minutes: 10
+
+      steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Test runner environment
+        run: |
+          echo "=== Self-hosted Runner Test ==="
+          echo "Hostname: $(hostname)"
+          echo "User: $(whoami)"
+          echo "Date: $(date)"
+          echo "Working Directory: $(pwd)"
+          echo "AWS Region: ${AWS_DEFAULT_REGION:-not set}"
+
+      - name: Test AWS access
+        run: |
+          echo "=== AWS Access Test ==="
+          aws sts get-caller-identity
+          aws ec2 describe-regions --region ap-northeast-1 --output table
+
+      - name: Test complete
+        run: |
+          echo "✅ Self-hosted runner test completed successfully!"
